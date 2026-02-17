@@ -8,7 +8,7 @@ spec:
   source:
     repoURL: https://github.com/VirajKumrawat/gitops-manifest-awstf.git
     targetRevision: main
-    path: 3tier-configs
+    path: .
   destination:
     server: https://kubernetes.default.svc
     namespace: 3tirewebapp-dev

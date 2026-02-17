@@ -1,3 +1,7 @@
+############################################
+# Availability Zones
+############################################
+
 data "aws_availability_zones" "available" {
   filter {
     name   = "opt-in-status"
@@ -8,6 +12,10 @@ data "aws_availability_zones" "available" {
 locals {
   azs = slice(data.aws_availability_zones.available.names, 0, 2)
 }
+
+############################################
+# VPC
+############################################
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
@@ -34,6 +42,10 @@ module "vpc" {
   }
 }
 
+############################################
+# EKS Cluster
+############################################
+
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 20.0"
@@ -59,8 +71,8 @@ module "eks" {
     }
   }
 
-  enable_irsa = true
-  enable_cluster_creator_admin_permissions = true
+  enable_irsa                               = true
+  enable_cluster_creator_admin_permissions  = true
 
   tags = {
     Environment = "dev"
@@ -68,13 +80,15 @@ module "eks" {
   }
 }
 
-# EBS CSI Driver IAM Role
+############################################
+# EBS CSI Driver IRSA
+############################################
+
 module "ebs_csi_driver_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
   version = "~> 5.0"
 
-  role_name_prefix = "ebs-csi-driver-"
-
+  role_name_prefix      = "ebs-csi-driver-"
   attach_ebs_csi_policy = true
 
   oidc_providers = {
@@ -90,74 +104,48 @@ module "ebs_csi_driver_irsa" {
   }
 }
 
-# EBS CSI Driver Addon
+############################################
+# EBS CSI Addon
+############################################
+
 resource "aws_eks_addon" "ebs_csi_driver" {
   cluster_name             = module.eks.cluster_name
   addon_name               = "aws-ebs-csi-driver"
   service_account_role_arn = module.ebs_csi_driver_irsa.iam_role_arn
 
-  tags = {
-    Environment = "dev"
-    Terraform   = "true"
-  }
+  depends_on = [module.eks]
 }
 
-# ArgoCD Namespace
-resource "kubernetes_namespace_v1" "argocd" {
-  metadata {
-    name = "argocd"
-  }
+############################################
+# ArgoCD Installation via Helm
+############################################
+
+resource "helm_release" "argocd" {
+  name             = "argocd"
+  namespace        = "argocd"
+  repository       = "https://argoproj.github.io/argo-helm"
+  chart            = "argo-cd"
+  create_namespace = true
+
+  values = [
+    <<-EOT
+    server:
+      service:
+        type: LoadBalancer
+    EOT
+  ]
 
   depends_on = [module.eks]
 }
 
-# Install ArgoCD using kubectl provider
-data "http" "argocd_manifest" {
-  url = "https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml"
-}
+############################################
+# Deploy Application via ArgoCD Application
+############################################
 
-resource "kubectl_manifest" "argocd" {
-  for_each = { for doc in split("---", data.http.argocd_manifest.response_body) : 
-    sha256(doc) => doc if trimspace(doc) != "" 
-  }
-
-  yaml_body = each.value
-  override_namespace = "argocd"
-
-  depends_on = [kubernetes_namespace_v1.argocd]
-}
-
-# Patch ArgoCD server service to LoadBalancer
-resource "null_resource" "patch_argocd_service" {
-  provisioner "local-exec" {
-    command = <<-EOT
-      # Update kubeconfig first
-      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
-      
-      # Wait a bit for service to be created
-      sleep 10
-      
-      # Patch service to LoadBalancer (ignore errors if already patched)
-      kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}' || true
-    EOT
-  }
-
-  depends_on = [kubectl_manifest.argocd]
-}
-
-# Application namespace - managed by ArgoCD Application manifest
-# Commenting out to avoid stuck namespace during destroy
-# The namespace is created by ArgoCD from the GitOps repository
-# resource "kubernetes_namespace_v1" "app" {
-#   metadata {
-#     name = "3tirewebapp-dev"
-#   }
-#   depends_on = [module.eks]
-# }
-
-# Deploy application via ArgoCD Application CRD
 resource "kubectl_manifest" "app_deployment" {
   yaml_body = file("${path.module}/../manifests/argocd-app.yaml")
 
-  depends_on = [kubectl_manifest.argocd]
+  depends_on = [
+    helm_release.argocd
+  ]
 }
